@@ -3,9 +3,10 @@ using SharpGen.Runtime;
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using VectorMelt;
+using Vortice.DCommon;  // 追加: PixelFormat, AlphaModeのため
 using Vortice.Direct2D1;
 using Vortice.Direct2D1.Effects;
+using Vortice.DXGI;     // 追加: Format等のため
 using Vortice.Mathematics;
 using YukkuriMovieMaker.Commons;
 using YukkuriMovieMaker.Player.Video;
@@ -94,7 +95,7 @@ namespace VectorMelt
             bool isForceReset = (interval > 0) && (frame > 0) && (frame % interval == 0);
             bool isUpdateFrame = (frame == 0) || (frame % updateInterval == 0);
 
-            // ★変更点1: offsetを取得
+            // offsetを取得
             using var currentBitmap = ConvertToBitmap(dc, this.inputCurrent, out var offset);
 
             // 初期化
@@ -113,14 +114,16 @@ namespace VectorMelt
             // --- Datamosh処理 ---
             if (!isFreeze || isForceReset)
             {
-                using var tempMat = BitmapToMat.BitmapToOpenCvMat(dc, currentBitmap);
+                // ★ 変更: 内部メソッド呼び出し
+                using var tempMat = BitmapToOpenCvMat(dc, currentBitmap);
                 tempMat.CopyTo(_accumulatorMat);
                 tempMat.CopyTo(_prevInputMat);
                 _mask.SetTo(0);
             }
             else if (isUpdateFrame)
             {
-                using var matCurr = BitmapToMat.BitmapToOpenCvMat(dc, currentBitmap);
+                // ★ 変更: 内部メソッド呼び出し
+                using var matCurr = BitmapToOpenCvMat(dc, currentBitmap);
 
                 if (_prevInputMat != null)
                 {
@@ -166,24 +169,27 @@ namespace VectorMelt
                 {
                     var maskToShow = (this.item.MaskSoftness.GetValue(frame, duration, fps) > 0) ? _maskBlur : _mask;
                     Cv2.CvtColor(maskToShow, _maskDebugColor, ColorConversionCodes.GRAY2BGRA);
-                    _outputBitmapCache = BitmapToMat.CreateD2DBitmapFromMat(dc, _maskDebugColor);
+                    // ★ 変更: 内部メソッド呼び出し
+                    _outputBitmapCache = CreateD2DBitmapFromMat(dc, _maskDebugColor);
                 }
                 else
                 {
-                    _outputBitmapCache = BitmapToMat.CreateD2DBitmapFromMat(dc, _accumulatorMat);
+                    // ★ 変更: 内部メソッド呼び出し
+                    _outputBitmapCache = CreateD2DBitmapFromMat(dc, _accumulatorMat);
                 }
             }
             else
             {
                 if (_accumulatorMat != null)
                 {
-                    _outputBitmapCache = BitmapToMat.CreateD2DBitmapFromMat(dc, _accumulatorMat);
+                    // ★ 変更: 内部メソッド呼び出し
+                    _outputBitmapCache = CreateD2DBitmapFromMat(dc, _accumulatorMat);
                 }
             }
 
             if (_outputBitmapCache != null)
             {
-                // ★変更点2: ズレた座標を元に戻す
+                // ズレた座標を元に戻す
                 this.wrap.TransformMatrix = Matrix3x2.CreateTranslation(offset);
                 this.wrap.SetInput(0, _outputBitmapCache, true);
             }
@@ -207,7 +213,6 @@ namespace VectorMelt
             double motionThreshold = this.item.MotionThreshold.GetValue(frame, duration, fps);
             int maskSoftness = (int)this.item.MaskSoftness.GetValue(frame, duration, fps);
             var targetMode = this.item.Target;
-            // double blockSize = ... (計算には使いません)
 
             var interpolation = this.item.CalcMoshMethodMode switch
             {
@@ -216,22 +221,15 @@ namespace VectorMelt
                 _ => InterpolationFlags.Nearest
             };
 
-            // ※前回バグの原因になった「BlockSize補正」は削除しました。
-            // 動きが遅いと感じる場合は、YMM4の「強度X/Y」スライダーを上げてください。
-
             // ========================================================
-            // 1. マスク作成とベクトル消去 (ここが跡を残すキモ)
+            // 1. マスク作成とベクトル消去
             // ========================================================
             using var flowX = _flowLarge.ExtractChannel(0);
             using var flowY = _flowLarge.ExtractChannel(1);
             Cv2.Magnitude(flowX, flowY, _magnitude);
 
-            // 静止部分(閾値以下)を白(255)にする
             Cv2.Threshold(_magnitude, _mask, motionThreshold, 255, ThresholdTypes.BinaryInv);
             _mask.ConvertTo(_mask, MatType.CV_8U);
-
-            // ★静止している場所(白)の動きベクトルを強制的に (0, 0) にする
-            // これにより背景が固定され、跡が残ります。
             _flowLarge.SetTo(new Scalar(0, 0), _mask);
 
             // ========================================================
@@ -286,18 +284,12 @@ namespace VectorMelt
 
                 if (calcMaskMode == MaskMode.ChangeMode)
                 {
-                    // 背景(白) = 現在、動体(黒) = 過去 (跡が消える)
                     BlendWithMask(warped, matCurr, maskToUse);
                 }
                 else if (calcMaskMode == MaskMode.unChangeMode)
                 {
-                    // 背景(白) = 過去、動体(黒) = 現在 (跡が残る！)
                     using var invMask = new Mat();
                     Cv2.BitwiseNot(maskToUse, invMask);
-
-                    // 反転マスクを使うことで論理を合わせる
-                    // invMask(白=動作)の部分に matCurr(第2引数) を使い、
-                    // invMask(黒=静止)の部分は warped(第1引数) をそのまま残す
                     BlendWithMask(warped, matCurr, invMask);
                 }
             }
@@ -399,12 +391,12 @@ namespace VectorMelt
         {
             _accumulatorMat?.Dispose();
             _prevInputMat?.Dispose();
-            using var temp = BitmapToMat.BitmapToOpenCvMat(dc, source);
+            // ★ 変更: 内部メソッド呼び出し
+            using var temp = BitmapToOpenCvMat(dc, source);
             _accumulatorMat = temp.Clone();
             _prevInputMat = temp.Clone();
         }
 
-        // ★変更点1の詳細: offsetを返す
         private ID2D1Bitmap1 ConvertToBitmap(ID2D1DeviceContext dc, ID2D1Image image, out Vector2 offset)
         {
             var localBounds = dc.GetImageLocalBounds(image);
@@ -452,6 +444,77 @@ namespace VectorMelt
             _yW.Dispose(); _crW.Dispose(); _cbW.Dispose();
             _edges.Dispose(); _edgesColor.Dispose();
             _outputBitmapCache?.Dispose();
+        }
+
+        // --- 以下統合されたBitmapToMatのメソッド ---
+
+        private Mat BitmapToOpenCvMat(ID2D1DeviceContext dc, ID2D1Bitmap bitmap)
+        {
+            // CPU読み取り可能なBitmapか確認し、違えば作成してコピー
+            ID2D1Bitmap1? readableBitmap = null;
+            var bmp1 = bitmap.QueryInterfaceOrNull<ID2D1Bitmap1>();
+
+            if (bmp1 != null && (bmp1.Options & BitmapOptions.CpuRead) != BitmapOptions.None)
+            {
+                readableBitmap = bmp1;
+            }
+            else
+            {
+                bmp1?.Dispose();
+                var props = new BitmapProperties1(
+                    new PixelFormat(Format.B8G8R8A8_UNorm, AlphaMode.Premultiplied),
+                    96f, 96f,
+                    BitmapOptions.CannotDraw | BitmapOptions.CpuRead);
+
+                readableBitmap = dc.CreateBitmap(bitmap.PixelSize, props);
+                readableBitmap.CopyFromBitmap(bitmap);
+            }
+
+            // メモリマップしてOpenCVのMatにコピー
+            var map = readableBitmap.Map(MapOptions.Read);
+            try
+            {
+                // Mat作成 (BGRA)
+                using var tempMat = new Mat(
+                    readableBitmap.PixelSize.Height,
+                    readableBitmap.PixelSize.Width,
+                    MatType.CV_8UC4,
+                    map.Bits,
+                    map.Pitch
+                );
+                return tempMat.Clone(); // Cloneして返す（Map外でも使えるように）
+            }
+            finally
+            {
+                readableBitmap.Unmap();
+                // 一時的に作ったBitmapなら破棄
+                if (readableBitmap != bitmap)
+                {
+                    readableBitmap.Dispose();
+                }
+            }
+        }
+
+        private ID2D1Bitmap1 CreateD2DBitmapFromMat(ID2D1DeviceContext dc, Mat mat)
+        {
+            if (mat.Type() != MatType.CV_8UC4)
+                throw new ArgumentException("Mat type must be CV_8UC4 (BGRA32)");
+
+            var w = mat.Cols;
+            var h = mat.Rows;
+
+            var props = new BitmapProperties1(
+                new PixelFormat(Format.B8G8R8A8_UNorm, AlphaMode.Premultiplied),
+                96f, 96f,
+                BitmapOptions.None);
+
+            var bmp = dc.CreateBitmap(new SizeI(w, h), props);
+
+            int pitch = (int)mat.Step();
+
+            bmp.CopyFromMemory(mat.Data, pitch);
+
+            return bmp;
         }
     }
 }
